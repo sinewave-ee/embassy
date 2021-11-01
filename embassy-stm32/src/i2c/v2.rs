@@ -3,6 +3,7 @@ use core::marker::PhantomData;
 use core::task::Poll;
 
 use atomic_polyfill::{AtomicUsize, Ordering};
+use core::future::Future;
 use embassy::interrupt::InterruptExt;
 use embassy::util::Unborrow;
 use embassy::waitqueue::AtomicWaker;
@@ -93,6 +94,12 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
         unsafe {
             T::regs().cr1().modify(|reg| {
                 reg.set_pe(true);
+
+                reg.set_txie(true);
+                reg.set_rxie(true);
+                reg.set_tcie(true);
+                reg.set_stopie(true);
+                reg.set_nackie(true);
             });
         }
 
@@ -111,15 +118,22 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
         let regs = T::regs();
         let isr = regs.isr().read();
 
+        let n = T::state_number();
         if isr.tcr() || isr.tc() {
-            let n = T::state_number();
             STATE.chunks_transferred[n].fetch_add(1, Ordering::Relaxed);
-            STATE.waker[n].wake();
         }
+        STATE.waker[n].wake();
+
         // The flag can only be cleared by writting to nbytes, we won't do that here, so disable
         // the interrupt
         critical_section::with(|_| {
-            regs.cr1().modify(|w| w.set_tcie(false));
+            regs.cr1().modify(|w| {
+                w.set_tcie(false);
+                w.set_txie(false);
+                w.set_rxie(false);
+                w.set_stopie(false);
+                w.set_nackie(false);
+            });
         });
     }
 
@@ -172,6 +186,54 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
         }
     }
 
+    async fn master_read_async(
+        &mut self,
+        address: u8,
+        length: usize,
+        stop: Stop,
+        reload: bool,
+        restart: bool,
+    ) {
+        poll_fn(|cx| {
+            let state_number = T::state_number();
+            STATE.waker[state_number].register(cx.waker());
+            assert!(length < 256 && length > 0);
+
+            if !restart {
+                // Wait for any previous address sequence to end
+                // automatically. This could be up to 50% of a bus
+                // cycle (ie. up to 0.5/freq)
+                if unsafe { T::regs().cr2().read().start() } == i2c::vals::Start::START {
+                    return Poll::Pending;
+                }
+            }
+
+            // Set START and prepare to receive bytes into
+            // `buffer`. The START bit can be set even if the bus
+            // is BUSY or I2C is in slave mode.
+            let reload = if reload {
+                i2c::vals::Reload::NOTCOMPLETED
+            } else {
+                i2c::vals::Reload::COMPLETED
+            };
+
+            unsafe {
+                T::regs().cr2().modify(|w| {
+                    w.set_sadd((address << 1 | 0) as u16);
+                    w.set_add10(i2c::vals::Add::BIT7);
+                    w.set_rd_wrn(i2c::vals::RdWrn::READ);
+                    w.set_nbytes(length as u8);
+                    w.set_start(i2c::vals::Start::START);
+                    w.set_autoend(stop.autoend());
+                    w.set_reload(reload);
+                });
+            }
+
+            Poll::Ready(())
+        })
+        .await;
+    }
+
     unsafe fn master_write(address: u8, length: usize, stop: Stop, reload: bool) {
         assert!(length < 256 && length > 0);
 
@@ -200,6 +262,42 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
         });
     }
 
+    async unsafe fn master_write_async(address: u8, length: usize, stop: Stop, reload: bool) {
+        poll_fn(|cx| {
+            let state_number = T::state_number();
+            STATE.waker[state_number].register(cx.waker());
+            assert!(length < 256 && length > 0);
+
+            // Wait for any previous address sequence to end
+            // automatically. This could be up to 50% of a bus
+            // cycle (ie. up to 0.5/freq)
+            if T::regs().cr2().read().start() == i2c::vals::Start::START {
+                return Poll::Pending;
+            }
+
+            let reload = if reload {
+                i2c::vals::Reload::NOTCOMPLETED
+            } else {
+                i2c::vals::Reload::COMPLETED
+            };
+
+            // Set START and prepare to send `bytes`. The
+            // START bit can be set even if the bus is BUSY or
+            // I2C is in slave mode.
+            T::regs().cr2().modify(|w| {
+                w.set_sadd((address << 1 | 0) as u16);
+                w.set_add10(i2c::vals::Add::BIT7);
+                w.set_rd_wrn(i2c::vals::RdWrn::WRITE);
+                w.set_nbytes(length as u8);
+                w.set_start(i2c::vals::Start::START);
+                w.set_autoend(stop.autoend());
+                w.set_reload(reload);
+            });
+            Poll::Ready(())
+        })
+        .await
+    }
+
     unsafe fn master_continue(length: usize, reload: bool) {
         assert!(length < 256 && length > 0);
 
@@ -215,6 +313,31 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
             w.set_nbytes(length as u8);
             w.set_reload(reload);
         });
+    }
+
+    async unsafe fn master_continue_async(length: usize, reload: bool) {
+        poll_fn(|cx| {
+            let state_number = T::state_number();
+            STATE.waker[state_number].register(cx.waker());
+            assert!(length < 256 && length > 0);
+
+            if !T::regs().isr().read().tcr() {
+                return Poll::Pending;
+            }
+
+            let reload = if reload {
+                i2c::vals::Reload::NOTCOMPLETED
+            } else {
+                i2c::vals::Reload::COMPLETED
+            };
+
+            T::regs().cr2().modify(|w| {
+                w.set_nbytes(length as u8);
+                w.set_reload(reload);
+            });
+            Poll::Ready(())
+        })
+        .await
     }
 
     fn flush_txdr(&self) {
@@ -258,6 +381,39 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
         }
     }
 
+    async fn wait_txe_async(&self) -> Result<(), Error> {
+        poll_fn(|cx| {
+            let state_number = T::state_number();
+            STATE.waker[state_number].register(cx.waker());
+
+            unsafe {
+                T::regs().cr1().modify(|reg| {
+                    reg.set_txie(true);
+                    reg.set_rxie(true);
+                    reg.set_tcie(true);
+                    reg.set_stopie(true);
+                    reg.set_nackie(true);
+                });
+                let isr = T::regs().isr().read();
+                if isr.txe() {
+                    return Poll::Ready(Ok(()));
+                } else if isr.berr() {
+                    T::regs().icr().write(|reg| reg.set_berrcf(true));
+                    return Poll::Ready(Err(Error::Bus));
+                } else if isr.arlo() {
+                    T::regs().icr().write(|reg| reg.set_arlocf(true));
+                    return Poll::Ready(Err(Error::Arbitration));
+                } else if isr.nackf() {
+                    T::regs().icr().write(|reg| reg.set_nackcf(true));
+                    self.flush_txdr();
+                    return Poll::Ready(Err(Error::Nack));
+                }
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
     fn wait_rxne(&self) -> Result<(), Error> {
         loop {
             unsafe {
@@ -279,6 +435,38 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
         }
     }
 
+    async fn wait_rxne_async(&self) -> Result<(), Error> {
+        poll_fn(|cx| {
+            let state_number = T::state_number();
+            STATE.waker[state_number].register(cx.waker());
+            unsafe {
+                T::regs().cr1().modify(|reg| {
+                    reg.set_txie(true);
+                    reg.set_rxie(true);
+                    reg.set_tcie(true);
+                    reg.set_stopie(true);
+                    reg.set_nackie(true);
+                });
+                let isr = T::regs().isr().read();
+                if isr.rxne() {
+                    return Poll::Ready(Ok(()));
+                } else if isr.berr() {
+                    T::regs().icr().write(|reg| reg.set_berrcf(true));
+                    return Poll::Ready(Err(Error::Bus));
+                } else if isr.arlo() {
+                    T::regs().icr().write(|reg| reg.set_arlocf(true));
+                    return Poll::Ready(Err(Error::Arbitration));
+                } else if isr.nackf() {
+                    T::regs().icr().write(|reg| reg.set_nackcf(true));
+                    self.flush_txdr();
+                    return Poll::Ready(Err(Error::Nack));
+                }
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
     fn wait_tc(&self) -> Result<(), Error> {
         loop {
             unsafe {
@@ -298,6 +486,38 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
                 }
             }
         }
+    }
+
+    async fn wait_tc_async(&self) -> Result<(), Error> {
+        poll_fn(|cx| {
+            let state_number = T::state_number();
+            STATE.waker[state_number].register(cx.waker());
+            unsafe {
+                T::regs().cr1().modify(|reg| {
+                    reg.set_txie(true);
+                    reg.set_rxie(true);
+                    reg.set_tcie(true);
+                    reg.set_stopie(true);
+                    reg.set_nackie(true);
+                });
+                let isr = T::regs().isr().read();
+                if isr.tc() {
+                    return Poll::Ready(Ok(()));
+                } else if isr.berr() {
+                    T::regs().icr().write(|reg| reg.set_berrcf(true));
+                    return Poll::Ready(Err(Error::Bus));
+                } else if isr.arlo() {
+                    T::regs().icr().write(|reg| reg.set_arlocf(true));
+                    return Poll::Ready(Err(Error::Arbitration));
+                } else if isr.nackf() {
+                    T::regs().icr().write(|reg| reg.set_nackcf(true));
+                    self.flush_txdr();
+                    return Poll::Ready(Err(Error::Nack));
+                }
+            }
+            Poll::Pending
+        })
+        .await
     }
 
     fn read(&mut self, address: u8, buffer: &mut [u8], restart: bool) -> Result<(), Error> {
@@ -328,6 +548,49 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
             for byte in chunk {
                 // Wait until we have received something
                 self.wait_rxne()?;
+
+                unsafe {
+                    *byte = T::regs().rxdr().read().rxdata();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn read_async(
+        &mut self,
+        address: u8,
+        buffer: &mut [u8],
+        restart: bool,
+    ) -> Result<(), Error> {
+        let completed_chunks = buffer.len() / 255;
+        let total_chunks = if completed_chunks * 255 == buffer.len() {
+            completed_chunks
+        } else {
+            completed_chunks + 1
+        };
+        let last_chunk_idx = total_chunks.saturating_sub(1);
+
+        self.master_read_async(
+            address,
+            buffer.len().min(255),
+            Stop::Automatic,
+            last_chunk_idx != 0,
+            restart,
+        )
+        .await;
+
+        for (number, chunk) in buffer.chunks_mut(255).enumerate() {
+            if number != 0 {
+                // NOTE(unsafe) We have &mut self
+                unsafe {
+                    Self::master_continue_async(chunk.len(), number != last_chunk_idx).await;
+                }
+            }
+
+            for byte in chunk {
+                // Wait until we have received something
+                self.wait_rxne_async().await?;
 
                 unsafe {
                     *byte = T::regs().rxdr().read().rxdata();
@@ -380,6 +643,62 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
         }
         // Wait until the write finishes
         self.wait_tc()?;
+
+        if send_stop {
+            self.master_stop();
+        }
+        Ok(())
+    }
+
+    async fn write_async(
+        &mut self,
+        address: u8,
+        bytes: &[u8],
+        send_stop: bool,
+    ) -> Result<(), Error> {
+        let completed_chunks = bytes.len() / 255;
+        let total_chunks = if completed_chunks * 255 == bytes.len() {
+            completed_chunks
+        } else {
+            completed_chunks + 1
+        };
+        let last_chunk_idx = total_chunks.saturating_sub(1);
+
+        // I2C start
+        //
+        // ST SAD+W
+        // NOTE(unsafe) We have &mut self
+        unsafe {
+            Self::master_write_async(
+                address,
+                bytes.len().min(255),
+                Stop::Software,
+                last_chunk_idx != 0,
+            )
+            .await;
+        }
+
+        for (number, chunk) in bytes.chunks(255).enumerate() {
+            if number != 0 {
+                // NOTE(unsafe) We have &mut self
+                unsafe {
+                    Self::master_continue_async(chunk.len(), number != last_chunk_idx).await;
+                }
+            }
+
+            for byte in chunk {
+                // Wait until we are allowed to send data
+                // (START has been ACKed or last byte when
+                // through)
+                self.wait_txe_async().await?;
+
+                unsafe {
+                    T::regs().txdr().write(|w| w.set_txdata(*byte));
+                }
+            }
+        }
+        // Wait until the write finishes
+        self.wait_tc_async().await?;
 
         if send_stop {
             self.master_stop();
@@ -610,6 +929,58 @@ impl<'d, T: Instance> WriteRead for I2c<'d, T> {
         self.write(address, bytes, false)?;
         self.read(address, buffer, true)
         // Automatic Stop
+    }
+}
+
+use futures::TryFutureExt;
+
+impl<'d, T, TXDMA, RXDMA> embassy_traits::i2c::I2c for I2c<'d, T, TXDMA, RXDMA>
+where
+    T: Instance,
+{
+    type Error = embassy_traits::i2c::Error;
+
+    // rustfmt::skip because rustfmt removes the 'where' claus on the associated type.
+    #[rustfmt::skip]
+    type ReadFuture<'a> where Self: 'a = impl Future<Output = Result<(), embassy_traits::i2c::Error>> + 'a;
+
+    // rustfmt::skip because rustfmt removes the 'where' claus on the associated type.
+    #[rustfmt::skip]
+    type WriteFuture<'a> where Self: 'a = impl Future<Output = Result<(), embassy_traits::i2c::Error>> +'a;
+
+    // rustfmt::skip because rustfmt removes the 'where' claus on the associated type.
+    #[rustfmt::skip]
+    type WriteReadFuture<'a> where Self: 'a = impl Future<Output = Result<(), embassy_traits::i2c::Error>> +'a;
+
+    fn read<'a>(&'a mut self, address: u8, buf: &'a mut [u8]) -> Self::ReadFuture<'a> {
+        self.read_async(address, buf, false)
+            .map_err(|_| embassy_traits::i2c::Error::Other)
+    }
+
+    fn write<'a>(&'a mut self, address: u8, bytes: &'a [u8]) -> Self::WriteFuture<'a> {
+        self.write_async(address, bytes, false)
+            .map_err(|_| embassy_traits::i2c::Error::Other)
+    }
+
+    fn write_read<'a>(
+        &'a mut self,
+        address: u8,
+        bytes: &'a [u8],
+        buf: &'a mut [u8],
+    ) -> Self::WriteReadFuture<'a> {
+        async move {
+            if let Err(e) = self
+                .write_async(address, bytes, false)
+                .map_err(|_| embassy_traits::i2c::Error::Other)
+                .await
+            {
+                return Err(e);
+            }
+
+            self.read_async(address, buf, false)
+                .map_err(|_| embassy_traits::i2c::Error::Other)
+                .await
+        }
     }
 }
 

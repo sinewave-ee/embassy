@@ -68,6 +68,10 @@
 
 use core::future::Future;
 
+pub enum Error {
+    Other,
+}
+
 mod private {
     pub trait Sealed {}
 }
