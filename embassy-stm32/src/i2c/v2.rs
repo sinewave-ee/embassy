@@ -235,7 +235,7 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
     }
 
     unsafe fn master_write(address: u8, length: usize, stop: Stop, reload: bool) {
-        assert!(length < 256 && length > 0);
+        assert!(length < 256);
 
         // Wait for any previous address sequence to end
         // automatically. This could be up to 50% of a bus
@@ -266,7 +266,7 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
         poll_fn(|cx| {
             let state_number = T::state_number();
             STATE.waker[state_number].register(cx.waker());
-            assert!(length < 256 && length > 0);
+            assert!(length < 256);
 
             // Wait for any previous address sequence to end
             // automatically. This could be up to 50% of a bus
@@ -299,7 +299,7 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
     }
 
     unsafe fn master_continue(length: usize, reload: bool) {
-        assert!(length < 256 && length > 0);
+        assert!(length < 256);
 
         while !T::regs().isr().read().tcr() {}
 
@@ -319,7 +319,7 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
         poll_fn(|cx| {
             let state_number = T::state_number();
             STATE.waker[state_number].register(cx.waker());
-            assert!(length < 256 && length > 0);
+            assert!(length < 256);
 
             if !T::regs().isr().read().tcr() {
                 return Poll::Pending;
