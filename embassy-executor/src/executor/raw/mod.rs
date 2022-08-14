@@ -93,6 +93,8 @@ impl TaskHeader {
 pub struct TaskStorage<F: Future + 'static> {
     raw: TaskHeader,
     future: UninitCell<F>, // Valid if STATE_SPAWNED
+    #[cfg(feature = "rtos-trace")]
+    task_name: &'static str,
 }
 
 impl<F: Future + 'static> TaskStorage<F> {
@@ -103,6 +105,8 @@ impl<F: Future + 'static> TaskStorage<F> {
         Self {
             raw: TaskHeader::new(),
             future: UninitCell::uninit(),
+            #[cfg(feature = "rtos-trace")]
+            task_name: core::any::type_name::<F>(),
         }
     }
 
@@ -121,6 +125,8 @@ impl<F: Future + 'static> TaskStorage<F> {
     /// on a different executor.
     pub fn spawn(&'static self, future: impl FnOnce() -> F) -> SpawnToken<impl Sized> {
         if self.spawn_mark_used() {
+            #[cfg(feature = "rtos-trace")]
+            trace::task_new(self as *const _ as u32);
             return unsafe { SpawnToken::<F>::new(self.spawn_initialize(future)) };
         }
 
@@ -139,6 +145,18 @@ impl<F: Future + 'static> TaskStorage<F> {
         // Initialize the task
         self.raw.poll_fn.write(Self::poll);
         self.future.write(future());
+        #[cfg(feature = "rtos-trace")]
+        {
+            trace::task_send_info(
+                self as *const _ as u32,
+                rtos_trace::TaskInfo {
+                    name: self.task_name,
+                    priority: 0, // not sure how we'll set this yet
+                    stack_base: self.future.as_mut_ptr() as usize,
+                    stack_size: core::mem::size_of::<F>(),
+                },
+            )
+        }
         NonNull::new_unchecked(self as *const TaskStorage<F> as *const TaskHeader as *mut TaskHeader)
     }
 
@@ -327,9 +345,6 @@ impl Executor {
     /// sending the task to the executor thread.
     pub(super) unsafe fn spawn(&'static self, task: NonNull<TaskHeader>) {
         task.as_ref().executor.set(self);
-
-        #[cfg(feature = "rtos-trace")]
-        trace::task_new(task.as_ptr() as u32);
 
         critical_section::with(|cs| {
             self.enqueue(cs, task);
