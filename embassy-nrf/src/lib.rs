@@ -45,6 +45,11 @@ pub mod buffered_uarte;
 pub mod gpio;
 #[cfg(feature = "gpiote")]
 pub mod gpiote;
+
+// TODO: tested on other chips
+#[cfg(not(any(feature = "_nrf9160", feature = "_nrf5340-app")))]
+pub mod radio;
+
 #[cfg(any(feature = "nrf52832", feature = "nrf52833", feature = "nrf52840"))]
 pub mod i2s;
 pub mod nvmc;

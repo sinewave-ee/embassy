@@ -97,8 +97,9 @@ pub struct Config {
     pub adc: AdcClockSource,
     #[cfg(all(stm32f3, not(rcc_f37), adc3_common))]
     pub adc34: AdcClockSource,
-    #[cfg(stm32f334)]
-    pub hrtim: HrtimClockSource,
+
+    /// Per-peripheral kernel clock selection muxes
+    pub mux: super::mux::ClockMux,
 
     pub ls: super::LsConfig,
 }
@@ -122,13 +123,12 @@ impl Default for Config {
             // ensure ADC is not out of range by default even if APB2 is maxxed out (36mhz)
             adc_pre: ADCPrescaler::DIV6,
 
-
             #[cfg(all(stm32f3, not(rcc_f37)))]
             adc: AdcClockSource::Hclk(AdcHclkPrescaler::Div1),
             #[cfg(all(stm32f3, not(rcc_f37), adc3_common))]
             adc34: AdcClockSource::Hclk(AdcHclkPrescaler::Div1),
-            #[cfg(stm32f334)]
-            hrtim: HrtimClockSource::BusClk,
+
+            mux: Default::default(),
         }
     }
 }
@@ -207,6 +207,9 @@ pub(crate) unsafe fn init(config: Config) {
 
         out_freq
     });
+
+    #[cfg(stm32f3)]
+    let pll_mul_2 = pll.map(|pll| pll * 2u32);
 
     #[cfg(any(rcc_f1, rcc_f1cl, stm32f3))]
     let usb = match pll {
@@ -347,7 +350,8 @@ pub(crate) unsafe fn init(config: Config) {
         }
     };
 
-    #[cfg(stm32f334)]
+    /*
+    TODO: Maybe add something like this to clock_mux? How can we autogenerate the data for this?
     let hrtim = match config.hrtim {
         // Must be configured after the bus is ready, otherwise it won't work
         HrtimClockSource::BusClk => None,
@@ -363,11 +367,17 @@ pub(crate) unsafe fn init(config: Config) {
             Some(pll * 2u32)
         }
     };
+     */
+
+    config.mux.init();
 
     set_clocks!(
         hsi: hsi,
         hse: hse,
         pll1_p: pll,
+        #[cfg(stm32f3)]
+        pll1_p_mul_2: pll_mul_2,
+        hsi_div_244: hsi.map(|h| h / 244u32),
         sys: Some(sys),
         pclk1: Some(pclk1),
         pclk2: Some(pclk2),
@@ -378,8 +388,6 @@ pub(crate) unsafe fn init(config: Config) {
         adc: Some(adc),
         #[cfg(all(stm32f3, not(rcc_f37), adc3_common))]
         adc34: Some(adc34),
-        #[cfg(stm32f334)]
-        hrtim: hrtim,
         rtc: rtc,
         hsi48: hsi48,
         #[cfg(any(rcc_f1, rcc_f1cl, stm32f3))]

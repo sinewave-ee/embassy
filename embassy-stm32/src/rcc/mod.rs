@@ -31,7 +31,7 @@ mod _version;
 
 pub use _version::*;
 
-pub use crate::_generated::Clocks;
+pub use crate::_generated::{mux, Clocks};
 
 #[cfg(feature = "low-power")]
 /// Must be written within a critical section
