@@ -16,6 +16,9 @@ mod dmamux;
 #[cfg(dmamux)]
 pub use dmamux::*;
 
+mod util;
+pub(crate) use util::*;
+
 pub(crate) mod ringbuffer;
 pub mod word;
 
@@ -23,7 +26,7 @@ use core::mem;
 
 use embassy_hal_internal::{impl_peripheral, Peripheral};
 
-use crate::interrupt::Priority;
+use crate::interrupt;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -39,17 +42,18 @@ pub type Request = u8;
 #[cfg(not(any(dma_v2, bdma_v2, gpdma, dmamux)))]
 pub type Request = ();
 
-pub(crate) mod sealed {
-    pub trait Channel {
-        fn id(&self) -> u8;
-    }
-    pub trait ChannelInterrupt {
-        unsafe fn on_irq();
-    }
+pub(crate) trait SealedChannel {
+    fn id(&self) -> u8;
+}
+
+pub(crate) trait ChannelInterrupt {
+    #[cfg_attr(not(feature = "rt"), allow(unused))]
+    unsafe fn on_irq();
 }
 
 /// DMA channel.
-pub trait Channel: sealed::Channel + Peripheral<P = Self> + Into<AnyChannel> + 'static {
+#[allow(private_bounds)]
+pub trait Channel: SealedChannel + Peripheral<P = Self> + Into<AnyChannel> + 'static {
     /// Type-erase (degrade) this pin into an `AnyChannel`.
     ///
     /// This converts DMA channel singletons (`DMA1_CH3`, `DMA2_CH1`, ...), which
@@ -63,12 +67,12 @@ pub trait Channel: sealed::Channel + Peripheral<P = Self> + Into<AnyChannel> + '
 
 macro_rules! dma_channel_impl {
     ($channel_peri:ident, $index:expr) => {
-        impl crate::dma::sealed::Channel for crate::peripherals::$channel_peri {
+        impl crate::dma::SealedChannel for crate::peripherals::$channel_peri {
             fn id(&self) -> u8 {
                 $index
             }
         }
-        impl crate::dma::sealed::ChannelInterrupt for crate::peripherals::$channel_peri {
+        impl crate::dma::ChannelInterrupt for crate::peripherals::$channel_peri {
             unsafe fn on_irq() {
                 crate::dma::AnyChannel { id: $index }.on_irq();
             }
@@ -95,6 +99,13 @@ impl AnyChannel {
         &crate::_generated::DMA_CHANNELS[self.id as usize]
     }
 }
+
+impl SealedChannel for AnyChannel {
+    fn id(&self) -> u8 {
+        self.id
+    }
+}
+impl Channel for AnyChannel {}
 
 const CHANNEL_COUNT: usize = crate::_generated::DMA_CHANNELS.len();
 static STATE: [ChannelState; CHANNEL_COUNT] = [ChannelState::NEW; CHANNEL_COUNT];
@@ -124,9 +135,9 @@ pub(crate) fn slice_ptr_parts_mut<T>(slice: *mut [T]) -> (usize, usize) {
 // safety: must be called only once at startup
 pub(crate) unsafe fn init(
     cs: critical_section::CriticalSection,
-    #[cfg(bdma)] bdma_priority: Priority,
-    #[cfg(dma)] dma_priority: Priority,
-    #[cfg(gpdma)] gpdma_priority: Priority,
+    #[cfg(bdma)] bdma_priority: interrupt::Priority,
+    #[cfg(dma)] dma_priority: interrupt::Priority,
+    #[cfg(gpdma)] gpdma_priority: interrupt::Priority,
 ) {
     #[cfg(any(dma, bdma))]
     dma_bdma::init(

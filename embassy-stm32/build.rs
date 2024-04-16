@@ -272,8 +272,6 @@ fn main() {
                 "Bank1"
             } else if region.name.starts_with("BANK_2") {
                 "Bank2"
-            } else if region.name == "OTP" {
-                "Otp"
             } else {
                 continue;
             }
@@ -484,7 +482,7 @@ fn main() {
                 let expr = if let Some(mux) = self.chained_muxes.get(&v.name) {
                     self.gen_mux(mux)
                 } else {
-                    self.gen_clock(&v.name)
+                    self.gen_clock(v.name)
                 };
                 match_arms.extend(quote! {
                     crate::pac::rcc::vals::#enum_name::#variant_name => #expr,
@@ -509,25 +507,20 @@ fn main() {
         if let Some(rcc) = &p.rcc {
             let en = rcc.enable.as_ref().unwrap();
 
-            let rst = match &rcc.reset {
+            let (start_rst, end_rst) = match &rcc.reset {
                 Some(rst) => {
                     let rst_reg = format_ident!("{}", rst.register.to_ascii_lowercase());
                     let set_rst_field = format_ident!("set_{}", rst.field.to_ascii_lowercase());
-                    quote! {
-                        crate::pac::RCC.#rst_reg().modify(|w| w.#set_rst_field(true));
-                        crate::pac::RCC.#rst_reg().modify(|w| w.#set_rst_field(false));
-                    }
+                    (
+                        quote! {
+                            crate::pac::RCC.#rst_reg().modify(|w| w.#set_rst_field(true));
+                        },
+                        quote! {
+                            crate::pac::RCC.#rst_reg().modify(|w| w.#set_rst_field(false));
+                        },
+                    )
                 }
-                None => TokenStream::new(),
-            };
-
-            let after_enable = if chip_name.starts_with("stm32f2") {
-                // Errata: ES0005 - 2.1.11 Delay after an RCC peripheral clock enabling
-                quote! {
-                    cortex_m::asm::dsb();
-                }
-            } else {
-                TokenStream::new()
+                None => (TokenStream::new(), TokenStream::new()),
             };
 
             let ptype = if let Some(reg) = &p.registers { reg.kind } else { "" };
@@ -589,16 +582,29 @@ fn main() {
             };
 
             g.extend(quote! {
-                impl crate::rcc::sealed::RccPeripheral for peripherals::#pname {
+                impl crate::rcc::SealedRccPeripheral for peripherals::#pname {
                     fn frequency() -> crate::time::Hertz {
                         #clock_frequency
                     }
                     fn enable_and_reset_with_cs(_cs: critical_section::CriticalSection) {
                         #before_enable
                         #incr_stop_refcount
+
+                        #start_rst
+
                         crate::pac::RCC.#en_reg().modify(|w| w.#set_en_field(true));
-                        #after_enable
-                        #rst
+
+                        // we must wait two peripheral clock cycles before the clock is active
+                        // this seems to work, but might be incorrect
+                        // see http://efton.sk/STM32/gotcha/g183.html
+
+                        // dummy read (like in the ST HALs)
+                        let _ = crate::pac::RCC.#en_reg().read();
+
+                        // DSB for good measure
+                        cortex_m::asm::dsb();
+
+                        #end_rst
                     }
                     fn disable_with_cs(_cs: critical_section::CriticalSection) {
                         #before_disable
@@ -656,6 +662,7 @@ fn main() {
             #(pub use crate::pac::rcc::vals::#enum_names as #enum_names; )*
 
             #[derive(Clone, Copy)]
+            #[non_exhaustive]
             pub struct ClockMux {
                 #( #struct_fields, )*
             }
@@ -764,6 +771,8 @@ fn main() {
     #[rustfmt::skip]
     let signals: HashMap<_, _> = [
                 // (kind, signal) => trait
+        (("ucpd", "CC1"), quote!(crate::ucpd::Cc1Pin)),
+        (("ucpd", "CC2"), quote!(crate::ucpd::Cc2Pin)),
         (("usart", "TX"), quote!(crate::usart::TxPin)),
         (("usart", "RX"), quote!(crate::usart::RxPin)),
         (("usart", "CTS"), quote!(crate::usart::CtsPin)),
@@ -816,20 +825,20 @@ fn main() {
         (("dcmi", "PIXCLK"), quote!(crate::dcmi::PixClkPin)),
         (("usb", "DP"), quote!(crate::usb::DpPin)),
         (("usb", "DM"), quote!(crate::usb::DmPin)),
-        (("otg", "DP"), quote!(crate::usb_otg::DpPin)),
-        (("otg", "DM"), quote!(crate::usb_otg::DmPin)),
-        (("otg", "ULPI_CK"), quote!(crate::usb_otg::UlpiClkPin)),
-        (("otg", "ULPI_DIR"), quote!(crate::usb_otg::UlpiDirPin)),
-        (("otg", "ULPI_NXT"), quote!(crate::usb_otg::UlpiNxtPin)),
-        (("otg", "ULPI_STP"), quote!(crate::usb_otg::UlpiStpPin)),
-        (("otg", "ULPI_D0"), quote!(crate::usb_otg::UlpiD0Pin)),
-        (("otg", "ULPI_D1"), quote!(crate::usb_otg::UlpiD1Pin)),
-        (("otg", "ULPI_D2"), quote!(crate::usb_otg::UlpiD2Pin)),
-        (("otg", "ULPI_D3"), quote!(crate::usb_otg::UlpiD3Pin)),
-        (("otg", "ULPI_D4"), quote!(crate::usb_otg::UlpiD4Pin)),
-        (("otg", "ULPI_D5"), quote!(crate::usb_otg::UlpiD5Pin)),
-        (("otg", "ULPI_D6"), quote!(crate::usb_otg::UlpiD6Pin)),
-        (("otg", "ULPI_D7"), quote!(crate::usb_otg::UlpiD7Pin)),
+        (("otg", "DP"), quote!(crate::usb::DpPin)),
+        (("otg", "DM"), quote!(crate::usb::DmPin)),
+        (("otg", "ULPI_CK"), quote!(crate::usb::UlpiClkPin)),
+        (("otg", "ULPI_DIR"), quote!(crate::usb::UlpiDirPin)),
+        (("otg", "ULPI_NXT"), quote!(crate::usb::UlpiNxtPin)),
+        (("otg", "ULPI_STP"), quote!(crate::usb::UlpiStpPin)),
+        (("otg", "ULPI_D0"), quote!(crate::usb::UlpiD0Pin)),
+        (("otg", "ULPI_D1"), quote!(crate::usb::UlpiD1Pin)),
+        (("otg", "ULPI_D2"), quote!(crate::usb::UlpiD2Pin)),
+        (("otg", "ULPI_D3"), quote!(crate::usb::UlpiD3Pin)),
+        (("otg", "ULPI_D4"), quote!(crate::usb::UlpiD4Pin)),
+        (("otg", "ULPI_D5"), quote!(crate::usb::UlpiD5Pin)),
+        (("otg", "ULPI_D6"), quote!(crate::usb::UlpiD6Pin)),
+        (("otg", "ULPI_D7"), quote!(crate::usb::UlpiD7Pin)),
         (("can", "TX"), quote!(crate::can::TxPin)),
         (("can", "RX"), quote!(crate::can::RxPin)),
         (("eth", "REF_CLK"), quote!(crate::eth::RefClkPin)),
@@ -996,7 +1005,19 @@ fn main() {
         (("quadspi", "BK2_IO3"), quote!(crate::qspi::BK2D3Pin)),
         (("quadspi", "BK2_NCS"), quote!(crate::qspi::BK2NSSPin)),
         (("quadspi", "CLK"), quote!(crate::qspi::SckPin)),
-             ].into();
+        (("octospi", "IO0"), quote!(crate::ospi::D0Pin)),
+        (("octospi", "IO1"), quote!(crate::ospi::D1Pin)),
+        (("octospi", "IO2"), quote!(crate::ospi::D2Pin)),
+        (("octospi", "IO3"), quote!(crate::ospi::D3Pin)),
+        (("octospi", "IO4"), quote!(crate::ospi::D4Pin)),
+        (("octospi", "IO5"), quote!(crate::ospi::D5Pin)),
+        (("octospi", "IO6"), quote!(crate::ospi::D6Pin)),
+        (("octospi", "IO7"), quote!(crate::ospi::D7Pin)),
+        (("octospi", "DQS"), quote!(crate::ospi::DQSPin)),
+        (("octospi", "NCS"), quote!(crate::ospi::NSSPin)),
+        (("octospi", "CLK"), quote!(crate::ospi::SckPin)),
+        (("octospi", "NCLK"), quote!(crate::ospi::NckPin)),
+    ].into();
 
     for p in METADATA.peripherals {
         if let Some(regs) = &p.registers {
@@ -1102,6 +1123,8 @@ fn main() {
 
     let signals: HashMap<_, _> = [
         // (kind, signal) => trait
+        (("ucpd", "RX"), quote!(crate::ucpd::RxDma)),
+        (("ucpd", "TX"), quote!(crate::ucpd::TxDma)),
         (("usart", "RX"), quote!(crate::usart::RxDma)),
         (("usart", "TX"), quote!(crate::usart::TxDma)),
         (("lpuart", "RX"), quote!(crate::usart::RxDma)),
@@ -1117,19 +1140,29 @@ fn main() {
         // SDMMCv1 uses the same channel for both directions, so just implement for RX
         (("sdmmc", "RX"), quote!(crate::sdmmc::SdmmcDma)),
         (("quadspi", "QUADSPI"), quote!(crate::qspi::QuadDma)),
+        (("octospi", "OCTOSPI1"), quote!(crate::ospi::OctoDma)),
         (("dac", "CH1"), quote!(crate::dac::DacDma1)),
         (("dac", "CH2"), quote!(crate::dac::DacDma2)),
         (("timer", "UP"), quote!(crate::timer::UpDma)),
         (("hash", "IN"), quote!(crate::hash::Dma)),
+        (("cryp", "IN"), quote!(crate::cryp::DmaIn)),
+        (("cryp", "OUT"), quote!(crate::cryp::DmaOut)),
         (("timer", "CH1"), quote!(crate::timer::Ch1Dma)),
         (("timer", "CH2"), quote!(crate::timer::Ch2Dma)),
         (("timer", "CH3"), quote!(crate::timer::Ch3Dma)),
         (("timer", "CH4"), quote!(crate::timer::Ch4Dma)),
+        (("cordic", "WRITE"), quote!(crate::cordic::WriteDma)), // FIXME: stm32u5a crash on Cordic driver
+        (("cordic", "READ"), quote!(crate::cordic::ReadDma)),   // FIXME: stm32u5a crash on Cordic driver
     ]
     .into();
 
     for p in METADATA.peripherals {
         if let Some(regs) = &p.registers {
+            // FIXME: stm32u5a crash on Cordic driver
+            if chip_name.starts_with("stm32u5a") && regs.kind == "cordic" {
+                continue;
+            }
+
             let mut dupe = HashSet::new();
             for ch in p.dma_channels {
                 // Some chips have multiple request numbers for the same (peri, signal, channel) combos.
@@ -1472,7 +1505,7 @@ fn main() {
                 #[crate::interrupt]
                 unsafe fn #irq () {
                     #(
-                        <crate::peripherals::#channels as crate::dma::sealed::ChannelInterrupt>::on_irq();
+                        <crate::peripherals::#channels as crate::dma::ChannelInterrupt>::on_irq();
                     )*
                 }
             }
