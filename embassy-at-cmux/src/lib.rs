@@ -255,7 +255,10 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
 
         let rx_fut = async {
             loop {
-                let header = frame::RxHeader::read(&mut port_r).await.unwrap();
+                let Ok(header) = frame::RxHeader::read(&mut port_r).await else {
+                    error!("Failed to read header");
+                    continue;
+                };
                 trace!("{:?}", header);
 
                 if header.len > 0 {
