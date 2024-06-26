@@ -77,6 +77,7 @@ impl<'d, T: Instance> Rng<'d, T> {
             reg.set_rngen(true);
         });
         // Reference manual says to discard the first.
+        #[cfg(not(feature = "stm32h723zg"))]
         let _ = self.next_u32();
     }
 
@@ -118,15 +119,49 @@ impl<'d, T: Instance> Rng<'d, T> {
     }
 
     /// Try to recover from a seed error.
+    #[cfg(feature = "stm32h723zg")]
     pub fn recover_seed_error(&mut self) {
+        defmt::warn!("recover_seed_error");
+
+        // set CONDRST = 1
+        T::regs().cr().write(|r| r.0 |= 1 << 30);
+        // set CONDRST = 0
+        T::regs().cr().write(|r| r.0 &= !(1 << 30));
+
+        // wait for CONDRST to be reset
+        while T::regs().cr().read().0 & (1 << 30) != 0 {}
+
+        T::regs().sr().modify(|r| {
+            if r.seis() {
+                // clear SEIS
+                r.set_seis(false)
+            }
+        });
+
+        // wait for SECS to be cleared
+        defmt::trace!("waiting for SECS to be cleared");
+        while T::regs().sr().read().secs() {}
+
+        defmt::trace!("resetting");
         self.reset();
+        defmt::trace!("reset done");
+    }
+
+    /// Try to recover from a seed error.
+    #[cfg(not(feature = "stm32h723zg"))]
+    pub fn recover_seed_error(&mut self) {
+        defmt::warn!("recover_seed_error");
+        self.reset();
+        defmt::trace!("reset done");
         // reset should also clear the SEIS flag
         if T::regs().sr().read().seis() {
             warn!("recovering from seed error failed");
             return;
         }
+        defmt::trace!("waiting for SECS to be cleared");
         // wait for SECS to be cleared by RNG
         while T::regs().sr().read().secs() {}
+        defmt::trace!("SECS cleared");
     }
 
     /// Fill the given slice with random values.
