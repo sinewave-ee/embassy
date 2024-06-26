@@ -249,16 +249,21 @@ pub enum FrameType {
     Ui = 0x03,
 }
 
-impl From<u8> for FrameType {
-    fn from(value: u8) -> Self {
+impl TryFrom<u8> for FrameType {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value & !PF {
-            0x2F => Self::Sabm,
-            0x63 => Self::Ua,
-            0x0F => Self::Dm,
-            0x43 => Self::Disc,
-            0xEF => Self::Uih,
-            0x03 => Self::Ui,
-            n => panic!("Unknown frame type {:#02x}", n),
+            0x2F => Ok(Self::Sabm),
+            0x63 => Ok(Self::Ua),
+            0x0F => Ok(Self::Dm),
+            0x43 => Ok(Self::Disc),
+            0xEF => Ok(Self::Uih),
+            0x03 => Ok(Self::Ui),
+            n => {
+                error!("Unknown frame type {:#02x}", n);
+                return Err(Error::MalformedFrame);
+            }
         }
     }
 }
@@ -569,14 +574,17 @@ impl<'a, R: embedded_io_async::BufRead> RxHeader<'a, R> {
     pub(crate) async fn read(reader: &'a mut R) -> Result<Self, Error> {
         let mut fcs = FCS.digest();
 
-        let mut header = [FLAG; 3];
+        let mut header = [0; 3];
+        while header[0] != FLAG {
+            Self::read_exact(reader, &mut header[..1]).await?;
+        }
         while header[0] == FLAG {
             Self::read_exact(reader, &mut header[..1]).await?;
         }
         Self::read_exact(reader, &mut header[1..]).await?;
 
         let id = header[0] >> 2;
-        let frame_type = FrameType::from(header[1]);
+        let frame_type = FrameType::try_from(header[1])?;
 
         fcs.update(&header);
 
