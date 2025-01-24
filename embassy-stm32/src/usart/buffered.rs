@@ -611,6 +611,23 @@ impl<'d> BufferedUartRx<'d> {
         .await
     }
 
+    async fn fill_ring_buf(&self) -> Result<(&[u8], &[u8]), Error> {
+        poll_fn(move |cx| {
+            let state = self.state;
+            let mut rx_reader = unsafe { state.rx_buf.reader() };
+            let [(p0, n0), (p1, n1)] = rx_reader.pop_bufs();
+            if n0 == 0 {
+                state.rx_waker.register(cx.waker());
+                return Poll::Pending;
+            }
+
+            let buf0 = unsafe { slice::from_raw_parts(p0, n0) };
+            let buf1 = unsafe { slice::from_raw_parts(p1, n1) };
+            Poll::Ready(Ok((buf0, buf1)))
+        })
+        .await
+    }
+
     fn consume(&self, amt: usize) {
         let state = self.state;
         let mut rx_reader = unsafe { state.rx_buf.reader() };
@@ -837,6 +854,10 @@ impl<'d> embedded_io_async::BufRead for BufferedUart<'d> {
         self.rx.fill_buf().await
     }
 
+    async fn fill_ring_buf(&mut self) -> Result<(&[u8], &[u8]), Self::Error> {
+        self.rx.fill_ring_buf().await
+    }
+
     fn consume(&mut self, amt: usize) {
         self.rx.consume(amt)
     }
@@ -845,6 +866,10 @@ impl<'d> embedded_io_async::BufRead for BufferedUart<'d> {
 impl<'d> embedded_io_async::BufRead for BufferedUartRx<'d> {
     async fn fill_buf(&mut self) -> Result<&[u8], Self::Error> {
         Self::fill_buf(self).await
+    }
+
+    async fn fill_ring_buf(&mut self) -> Result<(&[u8], &[u8]), Self::Error> {
+        Self::fill_ring_buf(self).await
     }
 
     fn consume(&mut self, amt: usize) {

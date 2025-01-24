@@ -366,6 +366,33 @@ impl<'a> Reader<'a> {
         (unsafe { buf.add(start) }, n)
     }
 
+    pub fn pop_bufs(&mut self) -> [(*mut u8, usize); 2] {
+        // Ordering: pushing writes `end` last, so we read `end` first.
+        // Read it with Acquire ordering, so that the next accesses can't be reordered up past it.
+        // This is needed to guarantee we "see" the data written by the writer.
+        let mut end = self.0.end.load(Ordering::Acquire);
+        let buf = self.0.buf.load(Ordering::Relaxed);
+        let len = self.0.len.load(Ordering::Relaxed);
+        let mut start = self.0.start.load(Ordering::Relaxed);
+
+        if start == end {
+            return [(buf, 0), (buf, 0)];
+        }
+
+        if start >= len {
+            start -= len
+        }
+        if end >= len {
+            end -= len
+        }
+
+        let n0 = if end > start { end - start } else { len - start };
+        let n1 = if end <= start { end } else { 0 };
+
+        trace!("  ringbuf: pop_bufs {:?}..{:?}, 0..{:?}", start, start + n0, n1);
+        [(unsafe { buf.add(start) }, n0), (buf, n1)]
+    }
+
     /// Mark n bytes as read and allow advance the read index.
     pub fn pop_done(&mut self, n: usize) {
         trace!("  ringbuf: pop {:?}", n);
