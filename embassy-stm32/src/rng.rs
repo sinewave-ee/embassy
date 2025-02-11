@@ -225,11 +225,31 @@ impl<'d, T: Instance> Rng<'d, T> {
 impl<'d, T: Instance> RngCore for Rng<'d, T> {
     fn next_u32(&mut self) -> u32 {
         loop {
-            let sr = T::regs().sr().read();
-            if sr.seis() | sr.ceis() {
-                self.reset();
-            } else if sr.drdy() {
-                return T::regs().dr().read();
+            let bits = T::regs().sr().read();
+            if !bits.seis() && !bits.ceis() && !bits.drdy() {
+                continue;
+            }
+            if bits.seis() {
+                // in case of noise-source or seed error we try to recover here
+                // but we must not use the data in DR and we return an error
+                // to leave retry-logic to the application
+                self.recover_seed_error();
+                continue;
+            } else if bits.ceis() {
+                // clock error detected, DR could still be used but keep it safe,
+                // clear the error and retry
+                T::regs().sr().modify(|sr| sr.set_ceis(false));
+                continue;
+            } else if bits.drdy() {
+                // DR can be read up to four times until the output buffer is empty
+                // DRDY is cleared automatically when that happens
+                let random_word = T::regs().dr().read();
+                // reference manual: always check if DR is zero
+                if random_word == 0 {
+                    continue;
+                }
+                // write bytes to chunk
+                return random_word;
             }
         }
     }
